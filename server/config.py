@@ -71,6 +71,57 @@ class Settings(BaseModel):
     conversation_summary_threshold: int = Field(default=100)
     conversation_summary_tail_size: int = Field(default=10)
 
+    # Agent matching / roster controls
+    embedding_model: str = Field(default=os.getenv("OPENPOKE_EMBEDDING_MODEL", "openai/text-embedding-3-small"))
+    embedding_timeout_seconds: float = Field(default=10.0)
+
+    # How many roster candidates the dedup LLM call may consider.
+    agent_dedup_top_k: int = Field(default=_env_int("OPENPOKE_AGENT_DEDUP_TOP_K", 5))
+    # Roster entries rendered into the interaction agent prompt; retrieval only
+    # kicks in once the roster is larger than this, so small rosters pay nothing.
+    agent_prompt_top_k: int = Field(default=_env_int("OPENPOKE_AGENT_PROMPT_TOP_K", 15))
+    # Recent agents always kept in the prompt regardless of semantic relevance.
+    agent_prompt_recent_count: int = Field(default=_env_int("OPENPOKE_AGENT_PROMPT_RECENT", 5))
+    # Below this cosine similarity a candidate is not worth showing the judge.
+    #
+    # Deliberately low, and NOT a safety threshold. An earlier value of 0.60 was
+    # calibrated on one labeled set where true reuse scored 0.64-0.77 and adversarial
+    # cases 0.50-0.57, which made a clean separating threshold look available. Across
+    # both labeled sets measured against openai/text-embedding-3-small the classes
+    # turn out to interleave completely:
+    #
+    #     true reuse    0.246 - 0.765   (0.246 is a pronoun reference: "ask *them*...")
+    #     adversarial   0.505 - 0.665
+    #
+    # No threshold separates those. At 0.60 the floor was discarding genuine reuse
+    # (recall fell to 33% on the ablation scenarios) while blocking nothing the judge
+    # would not have refused anyway - in live runs it prevented zero false merges.
+    #
+    # So the floor is now only a noise filter and a cost saver: unrelated requests
+    # score around 0.17, well under this. Everything above it is a mixed bag, and
+    # discrimination is the judge's job - which live evaluation shows it does
+    # reliably (correct abstention on every adversarial case tested).
+    #
+    # Tradeoff: more requests now reach the LLM, so this costs more per turn than
+    # 0.60 did. Recall is worth more than the saving.
+    #
+    # 0.20 sits just above measured unrelated content (~0.17) and just below the
+    # weakest true reuse (0.246). That is a narrow margin, and setting it by those
+    # two points is the same overfitting this comment warns about - so treat it as
+    # "low enough to be nearly inert" rather than as a tuned value. Pronoun-style
+    # requests genuinely live near the noise floor and no threshold rescues them;
+    # see the anaphora limitation in DESIGN.md.
+    agent_min_candidate_similarity: float = Field(default=0.20)
+    # When the top two candidates are within this margin, retrieval cannot tell them
+    # apart (two people named Keith, both about lunch). Staging a link on a coin flip
+    # is worse than staging none, so the tie is surfaced for clarification instead.
+    agent_ambiguity_margin: float = Field(default=0.05)
+    # Confidence a possible-duplicate link must reach before an actual merge.
+    agent_merge_commit_threshold: float = Field(default=0.9)
+    # Idle days before an agent drops out of the default prompt view. Agents that
+    # own a live trigger are exempt (a scheduled trigger means the work is ongoing).
+    agent_archive_after_days: int = Field(default=_env_int("OPENPOKE_AGENT_ARCHIVE_AFTER_DAYS", 30))
+
     @property
     def cors_allow_origins(self) -> List[str]:
         """Parse CORS origins from comma-separated string."""

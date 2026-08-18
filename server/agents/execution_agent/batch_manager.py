@@ -55,17 +55,39 @@ class ExecutionBatchManager:
         if not request_id:
             request_id = str(uuid.uuid4())
 
+        from ...services.execution import get_agent_roster
+        from ...services.execution.agent_matcher import reconcile_around
+
+        roster = get_agent_roster()
+        # Follow merge pointers before running. A trigger row stores its owner by
+        # name, so a trigger created before a merge would otherwise reactivate an
+        # agent that no longer owns the thread.
+        agent_name = roster.resolve_name(agent_name)
+
         batch_id = await self._register_pending_execution(agent_name, instructions, request_id)
 
         try:
             logger.info(f"[{agent_name}] Execution started")
             runtime = ExecutionAgentRuntime(agent_name=agent_name)
-            result = await asyncio.wait_for(
-                runtime.execute(instructions),
-                timeout=self.timeout_seconds,
-            )
+            # Serialize per agent so two turns cannot both load the same transcript
+            # and append interleaved, conflicting results. Unrelated agents still
+            # run fully in parallel.
+            async with roster.lock_for(agent_name):
+                result = await asyncio.wait_for(
+                    runtime.execute(instructions),
+                    timeout=self.timeout_seconds,
+                )
             status = "SUCCESS" if result.success else "FAILED"
             logger.info(f"[{agent_name}] Execution finished: {status}")
+
+            # Fresh log entries may contain the structural evidence (a shared Gmail
+            # thread id) that settles a staged duplicate link. Reconcile in both
+            # directions: this agent's own link, and any link elsewhere that names
+            # this agent as its target - the evidence may have just landed here.
+            try:
+                reconcile_around(agent_name)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(f"[{agent_name}] Link reconciliation failed: {exc}")
         except asyncio.TimeoutError:
             logger.error(f"[{agent_name}] Execution timed out after {self.timeout_seconds}s")
             result = ExecutionResult(

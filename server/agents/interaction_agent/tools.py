@@ -3,11 +3,19 @@
 import asyncio
 import json
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
+from ...config import get_settings
 from ...logging_config import logger
 from ...services.conversation import get_conversation_log
 from ...services.execution import get_agent_roster, get_execution_agent_logs
+from ...services.execution.agent_matcher import (
+    agent_embedding_text,
+    decide_routing,
+    embed_text,
+    find_candidates,
+)
+from ...services.execution.roster import DuplicateLink
 from ..execution_agent.batch_manager import ExecutionBatchManager
 
 
@@ -88,6 +96,28 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "search_agents",
+            "description": (
+                "Search all execution agents by meaning, including long-idle ones that are "
+                "not listed in your active agent roster. Use this when the user refers to "
+                "past work you cannot see in the roster above."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What to look for, e.g. 'lunch plans with Keith'.",
+                    },
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "wait",
             "description": "Wait silently when a message is already in conversation history to avoid duplicating responses. Adds a <wait> log entry that is not visible to the user.",
             "parameters": {
@@ -109,20 +139,135 @@ _EXECUTION_BATCH_MANAGER = ExecutionBatchManager()
 
 
 # Create or reuse execution agent and dispatch instructions asynchronously
-def send_message_to_agent(agent_name: str, instructions: str) -> ToolResult:
-    """Send instructions to an execution agent."""
+async def send_message_to_agent(agent_name: str, instructions: str) -> ToolResult:
+    """Route instructions to an execution agent, reusing or linking where warranted.
+
+    Routing ladder, cheapest first:
+      1. Exact name match  -> reuse immediately, zero extra API calls.
+      2. Semantic search   -> shortlist similar agents (lexical fallback on failure).
+      3. LLM judgment      -> describe the new agent and optionally *stage* a
+                              duplicate link. Never merges here; see agent_matcher.
+    """
     roster = get_agent_roster()
     roster.load()
-    existing_agents = set(roster.get_agents())
-    is_new = agent_name not in existing_agents
 
-    if is_new:
-        roster.add_agent(agent_name)
+    # (1) Exact match: the common case when the model reuses a name it just used.
+    # Keeping this ahead of retrieval means repeat delegations cost nothing extra.
+    existing = roster.get_record(agent_name)
+    if existing is not None:
+        resolved_name = roster.resolve_name(agent_name)
+        roster.mark_active(resolved_name)
+        return _dispatch_to_agent(resolved_name, instructions, action="reused")
 
+    settings = get_settings()
+    candidates = []
+
+    # (2) Retrieval. A failed embedding degrades to lexical overlap rather than
+    # blocking the turn; see find_candidates.
+    query_text = f"{agent_name}. {instructions}"
+    query_embedding = await embed_text(query_text)
+    searchable = roster.get_records(include_archived=True)
+    if searchable:
+        candidates = find_candidates(
+            query_text=query_text,
+            query_embedding=query_embedding,
+            records=searchable,
+            top_k=settings.agent_dedup_top_k,
+        )
+        # Nothing plausibly related: skip the judgment call entirely.
+        candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.score >= settings.agent_min_candidate_similarity
+        ]
+
+    # (2b) Ambiguity check. When the top two candidates score within a hair of each
+    # other, retrieval genuinely cannot separate them - two different people named
+    # Keith, both about lunch, is the canonical case. Asking the judge to choose
+    # produces a coin flip, and a 50/50 link is worse than no link: it is a wrong
+    # answer wearing the costume of a decision. Surface the tie instead.
+    if len(candidates) >= 2:
+        margin = candidates[0].score - candidates[1].score
+        if margin <= settings.agent_ambiguity_margin:
+            tied = [
+                candidate.record.name
+                for candidate in candidates
+                if candidates[0].score - candidate.score <= settings.agent_ambiguity_margin
+            ]
+            logger.info(
+                f"Ambiguous match for '{agent_name}': {', '.join(tied)} "
+                f"within {margin:.3f} - holding work for clarification"
+            )
+            # Start nothing. Dispatching while simultaneously asking "which one?"
+            # would be theatre: the execution agent could email the wrong Keith
+            # before the answer arrives, and asking after an irreversible action is
+            # worthless. Returning without starting work also means the turn
+            # produces nothing unless the model speaks to the user, so the pressure
+            # to actually ask is structural rather than merely instructed.
+            #
+            # No pending-state machine is needed to resume: the user's reply names
+            # the agent, and that call takes the exact-match fast path above.
+            return ToolResult(
+                success=True,
+                payload={
+                    "status": "needs_clarification",
+                    "ambiguous_with": tied,
+                    "note": (
+                        "Several existing agents match this request equally well: "
+                        f"{', '.join(tied)}. No work has been started and nothing was "
+                        "linked. Ask the user which one they mean, then call this tool "
+                        "again with that exact agent_name."
+                    ),
+                },
+            )
+
+    # (3) Judgment. Produces a description for future matching, plus at most a
+    # staged hypothesis that this continues an existing thread.
+    description = ""
+    duplicate_link = None
+    if candidates:
+        decision = await decide_routing(
+            instructions=instructions,
+            proposed_name=agent_name,
+            candidates=candidates,
+        )
+        description = decision.description
+        if decision.duplicate_of:
+            duplicate_link = DuplicateLink(
+                name=roster.resolve_name(decision.duplicate_of),
+                confidence=decision.confidence,
+                evidence=[f"text-similarity: {decision.confidence:.2f}"],
+            )
+            logger.info(
+                f"Staged duplicate link '{agent_name}' -> '{duplicate_link.name}' "
+                f"at {decision.confidence:.2f} (awaiting structural evidence)"
+            )
+
+    embedding_model = settings.embedding_model if query_embedding else None
+    description_embedding = query_embedding
+    if description and query_embedding is not None:
+        # Index the agent under its description rather than the raw first task, so
+        # later matches compare like with like.
+        description_embedding = (
+            await embed_text(agent_embedding_text(agent_name, description)) or query_embedding
+        )
+
+    record = await roster.create_or_link(
+        agent_name,
+        description=description,
+        embedding=description_embedding,
+        embedding_model=embedding_model,
+        possible_duplicate_of=duplicate_link,
+    )
+
+    roster.mark_active(record.name)
+    return _dispatch_to_agent(record.name, instructions, action="created")
+
+
+# Record the request and fire the execution agent without waiting for it
+def _dispatch_to_agent(agent_name: str, instructions: str, *, action: str) -> ToolResult:
     get_execution_agent_logs().record_request(agent_name, instructions)
-
-    action = "Created" if is_new else "Reused"
-    logger.info(f"{action} agent: {agent_name}")
+    logger.info(f"{action.capitalize()} agent: {agent_name}")
 
     async def _execute_async() -> None:
         try:
@@ -144,10 +289,44 @@ def send_message_to_agent(agent_name: str, instructions: str) -> ToolResult:
         success=True,
         payload={
             "status": "submitted",
+            # Report the canonical name back so the model's own context converges on
+            # it: the name it proposed may have been disambiguated or redirected.
             "agent_name": agent_name,
-            "new_agent_created": is_new,
+            "new_agent_created": action == "created",
         },
     )
+
+
+# Semantic search across every agent, including ones idle enough to leave the roster
+async def search_agents(query: str) -> ToolResult:
+    """Find agents by meaning, including long-idle ones absent from the prompt."""
+    roster = get_agent_roster()
+    roster.load()
+
+    records = roster.get_records(include_archived=True)
+    if not records:
+        return ToolResult(success=True, payload={"matches": []})
+
+    query_embedding = await embed_text(query)
+    candidates = find_candidates(
+        query_text=query,
+        query_embedding=query_embedding,
+        records=records,
+        top_k=get_settings().agent_dedup_top_k,
+    )
+
+    matches = [
+        {
+            "agent_name": candidate.record.name,
+            "description": candidate.record.description,
+            "last_active": candidate.record.last_active,
+            "score": round(candidate.score, 3),
+        }
+        for candidate in candidates
+        if candidate.score > 0
+    ]
+
+    return ToolResult(success=True, payload={"matches": matches})
 
 
 # Send immediate message to user and record in conversation history
@@ -215,7 +394,7 @@ def get_tool_schemas():
 
 
 # Route tool calls to appropriate handlers with argument validation and error handling
-def handle_tool_call(name: str, arguments: Any) -> ToolResult:
+async def handle_tool_call(name: str, arguments: Any) -> ToolResult:
     """Handle tool calls from interaction agent."""
     try:
         if isinstance(arguments, str):
@@ -225,8 +404,12 @@ def handle_tool_call(name: str, arguments: Any) -> ToolResult:
         else:
             return ToolResult(success=False, payload={"error": "Invalid arguments format"})
 
+        # Only the routing tools need to await anything (embeddings / judgment);
+        # the rest stay synchronous.
         if name == "send_message_to_agent":
-            return send_message_to_agent(**args)
+            return await send_message_to_agent(**args)
+        if name == "search_agents":
+            return await search_agents(**args)
         if name == "send_message_to_user":
             return send_message_to_user(**args)
         if name == "send_draft":

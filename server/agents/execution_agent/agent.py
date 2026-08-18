@@ -69,8 +69,10 @@ class ExecutionAgent:
         """
         base_prompt = self.build_system_prompt()
 
-        # Load history transcript
-        transcript = self._log_store.load_transcript(self.name)
+        # Load history transcript, prepending any agents that were merged into this
+        # one. Merging is a metadata pointer rather than a log rewrite, so the
+        # absorbed thread's context has to be stitched back in here.
+        transcript = self._load_transcript_with_merged()
 
         if transcript:
             # Apply conversation limit if needed
@@ -94,6 +96,32 @@ class ExecutionAgent:
             return f"{base_prompt}\n\n# Execution History\n\n{transcript}"
 
         return base_prompt
+
+    # Concatenate transcripts of merged-away agents ahead of this agent's own
+    def _load_transcript_with_merged(self) -> str:
+        own = self._log_store.load_transcript(self.name)
+
+        try:
+            from ...services.execution import get_agent_roster
+
+            merged_names = get_agent_roster().merged_sources(self.name)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(f"Failed to resolve merged agents for '{self.name}': {exc}")
+            return own
+
+        if not merged_names:
+            return own
+
+        sections: List[str] = []
+        for merged_name in merged_names:
+            merged_transcript = self._log_store.load_transcript(merged_name)
+            if merged_transcript:
+                sections.append(
+                    f"<merged_agent name=\"{merged_name}\">\n{merged_transcript}\n</merged_agent>"
+                )
+
+        sections.append(own)
+        return "\n".join(section for section in sections if section)
 
     # Format current instruction as user message for LLM consumption
     def build_messages_for_llm(self, current_instruction: str) -> List[Dict[str, str]]:
