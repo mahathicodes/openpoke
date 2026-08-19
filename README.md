@@ -108,6 +108,7 @@ concurrency, and every branch of the routing ladder.
 |---|---|---|
 | Prompt tokens at N=200 | 1,576 | 403 (flat regardless of N) |
 | Live selection accuracy, N=11 / N=200 | 100% / 94% | 100% / 100% |
+| Prompt-render recall @15, real embeddings, N=51 | — | 100% (18/18) |
 
 Accuracy showed no resolvable degradation across the roster sizes actually
 tested (up to N=200) — the fix is justified by cost, not accuracy. Nothing
