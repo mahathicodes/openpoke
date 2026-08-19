@@ -39,7 +39,6 @@ information-retrieval vocabulary; a couple are specific to this problem.
 | False merge | Wrongly merging two distinct threads — the expensive error here, since it's silent, permanent, and corrupts context going forward. |
 | Correct abstention | Declining to link when nothing fits, and creating a new agent instead. Roughly the behaviour that separates a usable system from one that always force-matches. |
 | Flip rate | Share of runs where the model answered differently on identical input. Measures instability, which a single run hides entirely. |
-| Rule of three | Statistics: observing zero failures in *n* trials bounds the true rate at roughly `3/n` at 95% confidence. Zero in 40 trials means "≤8%," not "zero." |
 
 ---
 
@@ -73,7 +72,8 @@ def build_distractors(count, targets):
 
     A first version filled the roster with agents sharing no person and no topic
     with any target, which made every correct agent rank first at every N - a flat
-    100% recall that measured nothing. Synthetic data that clean flatters the eval.
+    100% recall that measured nothing. Synthetic data that clean makes the eval
+    look easier than it is.
 
       ~40% share a target's PERSON (different topic)  <- the false-merge shape
       ~40% share a target's TOPIC  (different person)
@@ -122,9 +122,11 @@ DESIGN.md's degradation table for the full N-sweep with the correction applied.)
 - **Margin erodes 73%** (0.870 → 0.235). Rank never flips, but the safety gap
   narrows a lot — that gap is roughly how much noise a correct match can absorb
   before a confusable neighbour overtakes it.
-- **Accuracy shows no resolvable degradation.** Every interval overlaps every
-  other. Sonnet handled 200 unranked agents about as well as a small roster in
-  this test. The accuracy justification for prompt pruning didn't hold up and
+- **Accuracy shows no resolvable degradation up to N=200, the largest size
+  tested.** Every interval overlaps every other. Sonnet handled 200 unranked
+  agents about as well as a small roster in this test — but nothing past 200
+  was measured, so this doesn't rule out degradation at larger N. The accuracy
+  justification for prompt pruning didn't hold up within the tested range and
   was withdrawn; only the cost justification survives.
 - **Unexpected finding:** margin stops eroding around N≈10. Degradation seems to
   track confusable density rather than roster size — five agents about the same
@@ -133,7 +135,9 @@ DESIGN.md's degradation table for the full N-sweep with the correction applied.)
 
 ### What wasn't done
 
-The reference spec suggests testing to N=500; this stops at 200.
+This sweep stops at N=200. Pushing to N=500 would be a straightforward
+extension — nothing here caps the roster size, it's just where the sweep was
+stopped for time.
 
 ---
 
@@ -244,7 +248,7 @@ Links staged by the judge: 60   |   merges committed after the evidence gate: 0
 | Correct abstention | Decomposed by mechanism — floor vs. judge vs. evidence gate vs. ambiguity |
 | Exact-match baseline | 0% recall on the same cases |
 
-**The judge isn't perfect.** Across roughly 340 live decisions, one batch of 85
+**The judge makes mistakes.** Across roughly 340 live decisions, one batch of 85
 produced 3 bad links — "Vercel contractor invoice" linked to the Vercel *offer*
 thread, and a dental billing question to the dental *appointment*. The other
 ~255 produced none. All three were stopped by the evidence gate.
@@ -272,8 +276,6 @@ CONFIGS = [
     Config("A3  lexical, no embeddings",    use_embeddings=False),
     Config("A1  no retrieval (full roster)", show_full_roster=True),
     Config("A4  no similarity floor",       use_floor=False),
-    Config("A6  top_k=1",                   top_k=1),
-    Config("A6  top_k=10",                  top_k=10),
 ]
 ```
 
@@ -288,7 +290,6 @@ Run both offline (synthetic) and `--live` (real embeddings + real Sonnet).
 | A2 remove LLM judgment | bad links staged 0 → 2 | Judge looks justified |
 | A1 no retrieval, show everything | recall 100% → 100% | Retrieval isn't justified on recall alone — mainly cost |
 | A4 no similarity floor | recall 33% → 100% | Floor looked harmful here — changed a shipped default |
-| A6 top_k sweep (now measured, not just theorized: top_k=1 and top_k=10) | recall 100%, 0 false merges at both | Inconclusive — roster too small to say much |
 
 **On the A5 rerun.** A second live pass of the same 8-scenario ablation,
 run months apart, produced a different judge outcome: zero bad links staged, so
@@ -301,10 +302,12 @@ underpowered). Read both runs together rather than either alone: on this model,
 judgment errors that need the gate appear to be real but infrequent enough that
 an 8-scenario set won't reliably surface one, which is roughly why the gate is
 best thought of as insurance rather than something expected to fire on every
-small evaluation. The rule-of-three bound on the false-merge rate (~8% at 95%
-confidence from the 40-decision adversarial set) is still the honest ceiling; a
-clean rerun lowers confidence that the true rate sits near that ceiling, but
-doesn't move the bound itself.
+small evaluation. Separately, the 40-decision adversarial set has produced zero
+false merges so far — a good sign, but still a small number of runs. It shows
+the failure hasn't happened yet in the cases tried, not that it can't happen;
+this clean rerun doesn't change that read either way, it's just one more run
+with nothing to catch. More runs would be needed to know the real rate with
+any confidence.
 
 ### A4 changed the product
 
@@ -344,8 +347,8 @@ which is currently flat.
 
 ### Not covered
 
-The reference spec suggests ablating a recency/frequency prior against a
-larger, purpose-built dataset. What exists instead is a single live trial
+Ablating the recency/frequency prior against a larger, purpose-built dataset
+would be worth doing and wasn't. What exists instead is a single live trial
 (`eval_degradation.py --live`, section (d)): a just-touched agent, given a vague
 pronoun-style follow-up, survived prompt rendering both with and without the
 recency guarantee. One trial doesn't settle it either way — see DESIGN.md's
@@ -412,8 +415,10 @@ oversells its own coverage is arguably worse than a smaller, more honest one.
   mocked logs only, which is a gap worth noting since this is arguably the most
   important safety mechanism in the design.
 - **No latency measurement**, despite it being named as a constraint.
-- **Small samples.** Around 340 live judgment decisions. Rule of three bounds
-  the false-merge rate at ≤8%, not at zero.
+- **Small samples.** Around 340 live judgment decisions, zero committed false
+  merges observed. That's what happened in the runs done so far, not proof the
+  rate is actually zero — more runs would be needed to know the true rate with
+  confidence.
 - **The evaluation is itself unstable at n=5.** Two identical 5-run invocations
   returned 3 bad links and 0. The aggregate is more informative than any single
   run.
@@ -432,11 +437,11 @@ oversells its own coverage is arguably worse than a smaller, more honest one.
 
 > Three questions, three harnesses. Does the problem exist? For cost, fairly
 > decisively — 16× unbounded prompt growth, capped by the fix. For accuracy,
-> not really: the predicted degradation didn't appear, and that claim was
+> no: the predicted degradation didn't appear, and that claim was
 > withdrawn. Does each layer earn its place? Embeddings and the evidence gate
 > look justified, with numbers behind them; the similarity floor turned out to
 > be actively harmful and overfit to its own calibration set, which changed a
-> shipped default; the top_k ablation is inconclusive and labelled as such.
+> shipped default.
 > Is routing correct? 100% accuracy with zero committed false merges in these
 > runs — though the judge stages a bad link roughly 1% of the time in one
 > reading of the data, and the evidence gate is what stops those from becoming

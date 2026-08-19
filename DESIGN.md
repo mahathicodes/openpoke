@@ -3,11 +3,13 @@
 ## The problem, concretely
 
 OpenPoke spawns one long-lived execution agent per thread of work. The write-up
-that accompanies the project names "Agent Roster Bloat" as an open gap:
-*"Hundreds of agents compete for attention; scaling requires semantic search or
-caching solutions."*
+that accompanies the project names this "Execution Agent Overload" as an open
+gap: after days of use you might have "hundreds of specialized agents ...
+all competing for the Interaction Agent's attention," with "semantic search
+over agent descriptions" floated as "the naive solution" and archiving,
+clustering, or a recency-based hot cache mentioned as alternatives.
 
-Reading the code, that phrase turns out to cover two separate mechanisms, which
+Reading the code, that gap turns out to cover two separate mechanisms, which
 compound each other.
 
 **1. Reuse only ever happened on exact string equality.**
@@ -61,20 +63,32 @@ send_message_to_agent(name, instructions)
                                           staged duplicate link
 ```
 
-Stage 1 matters for cost, with one clarification worth being precise about: "no
-extra API call" means no additional call beyond the interaction agent's own
-turn, not that no model reasoning happens. The interaction agent is an LLM
-invoked once per turn regardless of which branch fires — it reads the user's
-message, decides what to do, and produces the tool call. When a request resolves
-via exact match, including the disambiguation-resume case where the user says
-"Chen" and the model has to recognise that means the `"Keith Chen lunch"` entry
-still sitting in its context from the earlier `ambiguous_with` list and then
-reproduce that name verbatim, that recognition is still real model inference. It
-just happens inside the turn that was going to run anyway, rather than costing a
-second, separate call the way stages 2 and 4 would. The common case is the model
-reusing a name it just used, and that path costs about the same as it did before
-this change — cheap in the sense of no added call, not in the sense of no
-thinking involved.
+Stage 1 matters for cost, with two clarifications worth being precise about.
+
+First: "no extra API call" means no additional call beyond the interaction
+agent's own turn, not that no model reasoning happens. The interaction agent
+is an LLM invoked once per turn regardless of which branch fires — it reads
+the user's message, decides what to do, and produces the tool call. When a
+request resolves via exact match, including the disambiguation-resume case
+where the user says "Chen" and the model has to recognise that means the
+`"Keith Chen lunch"` entry still sitting in its context from the earlier
+`ambiguous_with` list and then reproduce that name verbatim, that recognition
+is still real model inference. It just happens inside the turn that was going
+to run anyway, rather than costing a second, separate call the way stages 2
+and 4 would. The common case is the model reusing a name it just used, and
+that path costs about the same as it did before this change — cheap in the
+sense of no added call, though real model inference still happens.
+
+Second, and separately: this whole diagram starts from `send_message_to_agent`
+— after the model has already picked a name. Getting the model to that point
+can itself cost an embedding call, paid earlier during prompt construction by
+`_render_active_agents` (see "Bounded prompts" below), not by this routing
+step. That call fires on essentially every turn once the roster exceeds
+`agent_prompt_top_k`, independent of whether stage 1 here then hits exact
+match. So "no extra call" describes stage 1 specifically — confirming a name
+the model already chose — not the turn as a whole; the turn's own embedding
+cost, when the roster is big enough to trigger one, is accounted for
+separately.
 
 Stage 2 uses embeddings via OpenRouter's `/embeddings` endpoint, the same API
 key already configured, no new provider. If embeddings fail or time out,
@@ -83,6 +97,17 @@ retrieval falls back to lexical token overlap rather than failing the turn.
 Stage 4 sees only the shortlist, never the whole roster, so its prompt stays
 bounded regardless of roster size. An LLM-only matcher would likely have just
 moved the bloat problem into a different prompt rather than removed it.
+
+There's a third, easy-to-miss embedding call on the create-new-agent path,
+separate from stage 2's retrieval call: once stage 4 produces a description
+for the new agent, that description gets re-embedded (`tools.py:246-253`)
+rather than reusing stage 2's query embedding — the record is indexed under
+what it's actually about, not under the raw first task, so later retrieval
+compares like with like. This only fires when a new agent is being created and
+the judge produced a description, so it never happens on the exact-match path
+and never happens twice for the same delegation, but it means "create a new
+agent" carries one more embedding call than the stage 2 diagram alone
+suggests.
 
 ### Text similarity alone does not merge anything
 
@@ -113,7 +138,7 @@ evidence, not a measurement:
 | Shared Gmail `message_id` / `draft_id` | 0.6 — chosen, not measured | Both agents touched the same email. Still no merge — see below. |
 | Shared Gmail `thread_id` | 1.0 — definitional, not inferred | Clears the commit threshold, so an actual merge happens. |
 
-Only the last row is conclusive, and it isn't really an inference at all: a
+Only the last row is conclusive, and it's definitional rather than inferred: a
 shared Gmail `thread_id` is the same conversation by construction. The 0.5 and
 0.6 values are an ordering decision — message/draft evidence ranked above bare
 correspondent evidence, both kept comfortably under the 0.9 commit threshold so
@@ -153,8 +178,8 @@ lunch w/ Keith." Retrieval returns both at identical similarity — the gap
 between them is 0.0000.
 
 Asking the judge to choose here produces something close to a coin flip, and a
-50/50 answer seemed worse than no answer at all — closer to a guess dressed up
-as a decision. So when the top two candidates fall within
+50/50 answer seemed worse than no answer at all — closer to a guess than an
+actual decision. So when the top two candidates fall within
 `agent_ambiguity_margin`, the system starts no work: no agent created, no link
 staged, and the tied names are returned for the interaction agent to ask about.
 
@@ -175,7 +200,8 @@ started, also please ask" — one of those signals reads as "handled." Now the
 turn produces nothing unless the model speaks to the user, so the pressure to
 ask is more structural than purely instructional. It's still not a hard gate — a
 system-prompt section tells the model to clarify, and prompt instructions aren't
-controls — but the design at least doesn't work against itself anymore.
+controls — but the design now supports the behaviour it's trying to produce
+instead of undermining it.
 
 Cost: one extra round-trip on genuinely ambiguous requests, roughly what a human
 assistant would do, and only when two candidates land within 0.05 of each other.
@@ -251,7 +277,7 @@ the codebase rather than adding new infrastructure:
 
 Each stored vector records the model that produced it. On a model change, stale
 vectors are ignored for cosine scoring and that record falls back to lexical
-matching. This isn't optional bookkeeping: two models can emit vectors of the
+matching. This matters: two models can emit vectors of the
 same dimension, so without the tag, a model swap would yield similarity scores
 that look numerically plausible while meaning nothing — wrong, but invisible.
 
@@ -328,11 +354,12 @@ zero false merges on the adversarial set, and recall strictly better than the
 exact-match baseline, which is run over the same cases so the improvement is
 measured rather than assumed.
 
-**Statistical caveat**, printed by the harness itself: at this sample size, zero
-observed false merges bounds the true rate at roughly ≤25% with 95% confidence
-(rule of three). That's enough to catch a badly calibrated threshold; it isn't
-enough to certify rarity in production, and reporting "0%" without that
-qualifier would overstate what was actually shown.
+**Statistical caveat**, printed by the harness itself: zero false merges is
+what this small a set of adversarial cases produced, not proof the true rate is
+zero. That's enough to catch a badly calibrated threshold; it isn't enough to
+certify rarity in production, and reporting "0%" without that caveat would
+overstate what was actually shown. More runs would be needed to know the real
+rate with any confidence.
 
 ---
 
@@ -364,7 +391,8 @@ saving isn't available.
 ### The threshold: calibrated, then found to be overfit, then rebuilt
 
 This is probably the part of the evaluation most worth walking through, because
-the first answer here turned out to be confidently wrong.
+the first answer here turned out to be wrong despite looking well-supported at
+the time.
 
 **First pass.** A sweep over one labeled set suggested 0.60 was optimal — it
 kept 5/5 true reuse and let zero adversarial cases through to the judge. Clean
@@ -492,9 +520,10 @@ Two rounds of cases were added to address it:
 Without those additions, the judge's abstention — arguably the safety-critical
 half of its job — was effectively unmeasured while the report still read 100%.
 
-Statistical honesty: 40 adversarial decisions bounds the true false-merge rate
-at roughly ≤8% at 95% confidence (rule of three). Enough to catch a badly
-calibrated threshold; not enough to certify rarity in production.
+Statistical honesty: 40 adversarial decisions produced zero false merges.
+Enough to catch a badly calibrated threshold; not enough to certify rarity in
+production — that's what happened in the runs done so far, and more of them
+would be needed to know the real rate with confidence.
 
 ### A result that didn't match the hypothesis
 
@@ -592,8 +621,8 @@ directly and which is currently flat.
   are ever given a stored embedding, so those tests exercise the lexical
   fallback rather than cosine ranking. A live check now exists
   (`eval_degradation.py --live`, section (d)): at N=51 with real embeddings on
-  both sides, recall@15 was 100% (18/18) — the true match wasn't dropped in this
-  run. The same run also gave the recency guarantee its first actual ablation,
+  both sides, recall@15 was 100% (18/18) — the true match was retained in every
+  case this run. The same run also gave the recency guarantee its first actual ablation,
   previously just noted as never having been measured: a vague, pronoun-style
   follow-up for a just-touched agent survived both with and without the recency
   guarantee. That doesn't prove the guarantee unnecessary — one query against

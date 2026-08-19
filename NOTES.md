@@ -77,20 +77,41 @@ reconciliation reads them out of the log and would break if they were paraphrase
 
 ---
 
-## 3. No approval step before irreversible actions
+## 3. The approval step is prompt-only, and two of the three send tools skip it entirely
 
 `gmail_execute_draft` sends real email. `gmail_forward_email` forwards real email.
-Both sit in the execution agent's registry
-([`tools/registry.py`](server/agents/execution_agent/tools/registry.py)), callable
-from an autonomous loop. I grepped for `approv|confirm_|require_human|pending_review`
-across `server/` — there is no approval mechanism of any kind.
+`gmail_reply_to_thread` sends a reply. All three sit in the execution agent's
+registry ([`tools/registry.py`](server/agents/execution_agent/tools/registry.py)),
+callable from an autonomous loop.
 
-The interaction agent has a `send_draft` tool that records a draft for the user to
-read, which shows the shape was considered, but it is optional and advisory: nothing
-prevents an execution agent from sending directly.
+My original grep for `approv|confirm_|require_human|pending_review` missed the actual
+mechanism because it isn't a function name — it's a line of English in
+[`execution_agent/system_prompt.md:3`](server/agents/execution_agent/system_prompt.md):
+*"Don't ever execute a draft unless you receive explicit confirmation to execute it."*
+That's the human-in-the-loop step the project's own writeup describes (draft, shown to
+the user, sent only "once you confirm"), and it does exist here, wired to
+`gmail_execute_draft` specifically.
 
-Combined with finding #1, the blast radius is that injected text can cause
-irreversible outbound actions with no human in the path.
+Two gaps remain, both narrower than "no approval mechanism of any kind":
+
+- **It's an instruction, not a control.** Nothing in the tool wrapper enforces it —
+  a model that ignores that one line of the system prompt can call
+  `gmail_execute_draft` immediately after creating the draft, same turn, no code path
+  stops it.
+- **`gmail_forward_email` and `gmail_reply_to_thread` have no confirmation instruction
+  at all** — not even the prompt-level kind `gmail_execute_draft` gets. They're
+  send-capable and sit in the same registry, but nothing in the system prompt tells
+  the model to pause before using them.
+
+The interaction agent's `send_draft` tool records a draft for the user to read, which
+shows the shape was considered on that side too, but it's advisory the same way:
+nothing prevents an execution agent from sending directly regardless of what's been
+shown to the user.
+
+Combined with finding #1, the blast radius is that injected text can still cause an
+irreversible outbound action with no *enforced* human in the path — either by talking
+the model past the one prompt instruction that exists, or by routing through one of
+the two tools that were never given one.
 
 **How I would test it.** Tier actions by consequence (read-only / reversible /
 irreversible) and assert as an invariant that no irreversible tool is reachable
@@ -144,37 +165,6 @@ same, scoped per interaction turn.
 assert the fast result reaches the interaction agent before the slow one completes;
 then dispatch across two separate turns and assert the second turn's result is not
 gated on the first turn's straggler.
-
----
-
-## 6. Ambiguous requests are held, but clarification is not enforced
-
-Addressed in this submission; the residual gap belongs on the list.
-
-When two agents match equally well — two people named Keith, both with a lunch thread
-— the system detects the tie, starts no work, creates no agent, stages no link, and
-returns the tied names for the interaction agent to ask about. The user's reply routes
-by exact match, so no pending state is parked anywhere.
-
-What is still not guaranteed:
-
-- **Nothing forces the model to ask.** The tie is in the tool result and the system
-  prompt instructs clarification, but that is a prompt-level instruction, not a
-  control. A model that ignores both leaves the request silently unserved — which is
-  a *different* failure from doing the wrong thing, and arguably a safer one, but
-  still a failure.
-- **Ambiguity is only detected between existing agents.** A request ambiguous in a way
-  the roster cannot see — two Keiths where only one has an agent — looks unambiguous
-  and routes confidently to the wrong thread.
-- **The margin is a single global constant** (0.05), not calibrated per embedding
-  model. A model with a compressed similarity range would tie constantly; one with a
-  wide range would never tie. This needs setting from the live threshold sweep.
-
-**How I would close the first one.** Make it a real gate rather than an instruction:
-if the previous turn returned `needs_clarification` for a thread and the model tries
-to dispatch work on that thread without an intervening user message naming one of the
-candidates, refuse. That is enforceable in the tool wrapper, which is where controls
-belong — the same argument as the action tiering in finding #3.
 
 ---
 
@@ -257,48 +247,6 @@ place.
 
 ---
 
-## 9. Exact-match resume depends on unverified precise string reproduction
-
-Found while checking whether the ambiguity-resume flow (finding 6) is as solid
-as it's described.
-
-The resume flow is only tested for the case where the model reproduces the tied
-candidate's name exactly —
-`test_clarified_followup_routes_by_exact_match` calls
-`send_message_to_agent("Keith Chen lunch", ...)`, the literal stored string.
-There's no test for what happens if the model says something close but not
-exact after the user answers — just "Chen," or "Keith Chen" without "lunch."
-
-A near-miss here doesn't fail safely into "still holds the work" — it falls
-through to the ordinary miss path: full-roster retrieval, judge, staged link,
-new agent with an empty history. Same shape of problem as finding 8, except
-this time it happens inside the one flow that was specifically built to be the
-*safe* resolution of an ambiguity — the user already answered the question, and
-the system can still fragment the thread anyway.
-
-"Resuming needs no machinery" rests on one unstated assumption: that a name
-copied out of a tool result a turn ago comes back byte-for-byte. Nothing
-enforces that; it's trust in the model's copying behaviour, in the one flow
-explicitly designed to be a reliability guarantee rather than a best effort.
-
-**How I would test it.** Same pattern as finding 8 — write cases where the
-simulated follow-up uses a plausible partial name ("Chen," "the Chen thread")
-instead of the exact stored string, and check whether it still resolves to the
-intended agent or spins up a duplicate.
-
-**How I would fix it.** Narrow, short-lived state rather than a new
-pending-request machine, which would undercut the reason this design avoided
-one in the first place. Cache the tied candidate names from the immediately
-preceding turn — turn-scoped, not persisted — and when the very next
-`send_message_to_agent` call in that conversation doesn't hit exact match,
-check it against that small cached set with a looser comparison (substring or
-high lexical overlap) before falling through to full retrieval. This keeps the
-"no pending-state machine" property intact — the cache is one turn deep and
-expires immediately — while closing the gap between "the user answered" and
-"the system correctly understood the answer."
-
----
-
 ## 10. The core cost claim was never tested end-to-end with a real interaction agent
 
 Found while checking what our evals actually exercised, prompted by a good
@@ -371,10 +319,8 @@ Ordered by expected value:
 2. **Per-agent summarisation (#2)** — closes the tension my own change introduced.
 3. **Action tiering (#3)** — cheap to implement, and it bounds the damage from
    everything else on this list.
-4. **Resume fragility (#9)** — cheap, well-scoped fix, and it closes a gap in a
-   flow that's supposed to already be a safety guarantee, not a best effort.
-5. **Measuring search-vs-act behaviour (#8)** — cheap to measure, and the
+4. **Measuring search-vs-act behaviour (#8)** — cheap to measure, and the
    result determines whether the fix is worth building at all.
-6. **The real-interaction-agent cost eval (#10)** — a bigger lift than the
+5. **The real-interaction-agent cost eval (#10)** — a bigger lift than the
    others (needs the real system prompt and tool schema, not a stand-in), but
    it's the assumption the whole cost argument for this design rests on.

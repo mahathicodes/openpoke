@@ -536,8 +536,6 @@ CONFIGS = [
     Config("A3  lexical, no embeddings", use_embeddings=False),
     Config("A1  no retrieval (full roster)", show_full_roster=True),
     Config("A4  no similarity floor", use_floor=False),
-    Config("A6  top_k=1", top_k=1),
-    Config("A6  top_k=10", top_k=10),
 ]
 
 
@@ -683,11 +681,6 @@ def main() -> int:
           f"recall {baseline.recall:.0%} -> {a1.recall:.0%}.")
     print("     Ties back to the degradation experiment: an unranked full roster is both")
     print("     more expensive and harder to choose from.")
-
-    print("\n  A6 - top_k")
-    for label in ("A6  top_k=1", "A6  top_k=10"):
-        entry = by_label[label]
-        print(f"     {label:<18} recall {entry.recall:>4.0%}   false merges {entry.false_merges}")
 
     print("\n" + "-" * 88)
     print("READ THIS BEFORE QUOTING THE NUMBERS")

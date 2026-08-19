@@ -11,11 +11,11 @@ OpenPoke is a simplified, open-source take on [Interaction Company’s](https://
 
 ## Agent overload: what changed
 
-The project's own write-up names "Agent Roster Bloat" as an open gap: hundreds
-of execution agents competing for the interaction agent's attention. That
-turned out to be two independent problems — unbounded prompt cost, and reuse
-that only ever worked on exact string equality. Full rationale in
-[DESIGN.md](DESIGN.md); this section is the visual summary.
+The project's own write-up names this "Execution Agent Overload" as an open
+gap: hundreds of execution agents ending up "all competing for the Interaction
+Agent's attention." That turned out to be two independent problems — unbounded
+prompt cost, and reuse that only ever worked on exact string equality. Full
+rationale in [DESIGN.md](DESIGN.md); this section is the visual summary.
 
 ### Before
 
@@ -76,6 +76,24 @@ sequenceDiagram
 - Merging is a pointer, not a deletion. Both logs survive, and the surviving
   agent inherits the combined history from then on.
 
+### The agent record itself
+
+The roster used to be a flat `List[str]` — a name and nothing else. Every
+other mechanism above needed somewhere to live, so the record grew a schema:
+
+| Field | Before | After |
+|---|---|---|
+| `name` | the only thing stored | unchanged |
+| `description` | — | one-sentence summary of the thread; what the judge and prompt rendering actually match against |
+| `embedding` / `embedding_model` | — | the vector used for semantic retrieval, tagged with the model that produced it so a model swap can't silently produce meaningless scores |
+| `possible_duplicate_of` | — | a staged hypothesis — `{name, confidence, evidence[]}` — that never triggers a merge on its own |
+| `merged_into` | — | set once a real merge commits; the absorbed record and its log file both survive on disk |
+| `last_active` | — | drives the recency guarantee in prompt rendering and the archival cutoff |
+
+Nothing here replaced anything — every new field is additive on top of `name`,
+which is why the roster's legacy string-list format still loads without
+migration (tested directly: `test_legacy_string_list_roster_still_loads`).
+
 ### How it was evaluated
 
 Full methodology and every number below in [EVALUATION.md](EVALUATION.md).
@@ -93,10 +111,15 @@ concurrency, and every branch of the routing ladder.
 | Live selection accuracy, N=11 / N=200 | 100% / 94% | 100% / 100% |
 | Prompt-render recall @15, real embeddings, N=51 | — | 100% (18/18) |
 
-Accuracy showed no resolvable degradation at any roster size — the fix is
-justified by cost, not accuracy. [The dilution-hurts-accuracy hypothesis was
-tested directly and didn't hold up.] The recency guarantee's one live ablation
-was inconclusive (survived both with and without it on the one query tested).
+Accuracy showed no resolvable degradation across the roster sizes actually
+tested (up to N=200) — the fix is justified by cost, not accuracy. Nothing
+larger than N=200 was measured, so this doesn't rule out degradation past that
+point; it only says the dilution-hurts-accuracy hypothesis didn't hold up
+within the tested range. The recency guarantee's one live ablation was
+inconclusive: a just-touched agent survived a vague, pronoun-only follow-up
+whether the guarantee was on or off, so this single case shows the guarantee
+wasn't *necessary* for it — not that the guarantee doesn't matter more
+generally.
 
 **`eval_ablations.py` — does each layer earn its place?**
 
@@ -125,29 +148,75 @@ DESIGN.md.]
 one batch of 85 and 0 in a rerun of the same size — every one caught by the
 evidence gate before it could become a merge.]
 
+**What the 17 cases actually look like.** A handful, to make the numbers
+above concrete rather than abstract:
+
+| Type | Request | Should it link? |
+|---|---|---|
+| Paraphrase | "Check whether Keith ever replied about getting lunch." | Yes — existing "Email to Keith about lunch" agent |
+| Typo'd | "Emial to Kieth about lunhc" / "Send Kieth another note about lunhc" | Yes — same agent, despite the typos |
+| Pronoun only | "Ask them to raise the equity portion of the offer." | Yes — existing Vercel offer agent, no name mentioned at all |
+| Same person, different topic | "Order a birthday gift for Keith Rivera and have it delivered Friday." | **No** — classic false-merge trap; must create new |
+| Same company, different matter | "Ask Vercel accounts payable about my outstanding contractor invoice." | **No** — same company as the offer thread, unrelated business |
+| Two people, same name, same topic | "Follow up on lunch with Keith," with two Keith-lunch agents already existing | Neither — must hold and ask which one |
+| Same setup, surname supplied | "Follow up with Keith Chen about our lunch." | Yes, specifically the Chen one — checks it discriminates rather than freezing whenever names collide |
+| Empty roster | "Draft a note to the landlord about the broken heater," no agents exist yet | Creates new, no LLM call needed at all |
+
 ### Known limitations
 
-Full detail, evidence, and proposed fixes for each in [NOTES.md](NOTES.md).
+Full detail, evidence, and proposed fixes for each in [NOTES.md](NOTES.md),
+[DESIGN.md](DESIGN.md), and [EVALUATION.md](EVALUATION.md).
 
-- **Prompt injection** — untrusted email content reaches an agent holding
-  send-capable Gmail tools; nothing sanitizes it. Highest severity, not
-  mitigated.
-- **Unbounded per-agent context** — a busy or merged agent's history grows
-  without limit; nothing summarizes it.
-- **No approval gate on irreversible actions** — sending or forwarding email
-  has no human-in-the-loop check.
-- **Recovery from a naming miss is incidental, not guaranteed** — a new agent
-  has no idea it might be a duplicate, and the resume-after-clarification flow
-  is only verified for exact string reproduction, not a close paraphrase.
-- **The core cost/reuse claim was never tested against a real interaction
-  agent end to end** — every underlying piece (rendering, routing, judgment)
-  was tested individually; the full pipeline wasn't, for lack of time.
-- **Two pre-existing issues carried forward** — a global batch manager can
-  hold a fast agent's reply hostage to a slow one in the same batch, and
-  roster writes aren't safe across multiple server processes.
-- **Coverage stops at "is the logic correct," not "does the agent behave
-  correctly"** — nothing exercises real Gmail tool-use trajectories or
-  end-to-end outcomes, and a real Gmail merge has never been run.
+**1. Limitations with our evaluations and testing**
+
+Nothing here ever ran the full pipeline together — a live interaction agent,
+real Gmail, real execution agents, all at once. Everything below was tested in
+isolated pieces instead:
+
+- Never tested whether a real interaction agent actually reuses names as
+  often as we assumed — rendering, routing, and judgment were each tested
+  separately, not together.
+- Nothing tests real Gmail tool use — whether the execution agent searches
+  before acting, in the right order.
+- The merge path has never run against real Gmail. Every passing test uses a
+  hand-written fake thread ID, not one Gmail actually produced.
+- The evidence gate's necessity is unproven at this sample size: one run
+  caught 3 bad links, a rerun caught 0.
+- Sample sizes are small — around 340 live decisions, zero false merges. A
+  good sign, not proof; a rare failure could simply not have come up yet.
+- Results depend on one embedding model and one judge model. A cheaper
+  embedding model we tried broke the approach silently.
+
+**2. Limitations with our solution**
+
+- Most tunable numbers (how many recent agents to show, how many candidates
+  to consider, the ambiguity margin, the archive cutoff) were chosen by
+  judgment, not tested against data — and none of it has been validated at
+  larger scale or through the full pipeline running end to end.
+- Text similarity alone never merges two agents, by design — so a naming
+  miss always creates a duplicate, until real Gmail evidence arrives, if it
+  ever does.
+- Only links the judge actually flags get remembered. Turning a flagged link
+  into a real merge is incidental, not assisted — it depends on the new agent
+  happening to redo the same Gmail search, not on anything that nudges it to.
+- Descriptions are frozen at creation, so a thread that changes over months
+  keeps its original label.
+- Pronoun-only requests ("ask them...") can't be matched by similarity
+  search — there's no name in the sentence to match against, and no
+  similarity cutoff fixes that.
+- Merging concatenates transcripts, so merged agents are the ones most
+  likely to eventually hit a context limit.
+
+**3. Gaps in the existing codebase we noticed**
+
+*(beyond "Execution Agent Overload," the gap named in the project's own write-up)*
+
+- The one approval step that exists is a prompt instruction, not an
+  enforced control — nothing stops a model from ignoring it.
+- Execution history has no length limit — a busy thread just keeps growing
+  and gets replayed in full every time it fires.
+- A global batch manager can hold a fast agent's reply hostage to a slower
+  one — even one from a later, unrelated message.
 
 ---
 
