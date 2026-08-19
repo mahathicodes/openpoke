@@ -159,12 +159,9 @@ isolated pieces instead:
   before acting, in the right order.
 - The merge path has never run against real Gmail. Every passing test uses a
   hand-written fake thread ID, not one Gmail actually produced.
-- The evidence gate's necessity is unproven at this sample size: one run
-  caught 3 bad links, a rerun caught 0.
 - Sample sizes are small — around 340 live decisions, zero false merges. A
   good sign, not proof; a rare failure could simply not have come up yet.
-- Results depend on one embedding model and one judge model. A cheaper
-  embedding model we tried broke the approach silently.
+- Results depend on one embedding model and one judge model.
 
 **2. Limitations with our solution**
 
@@ -175,14 +172,9 @@ isolated pieces instead:
 - Text similarity alone never merges two agents, by design — so a naming
   miss always creates a duplicate, until real Gmail evidence arrives, if it
   ever does.
-- Only links the judge actually flags get remembered. Turning a flagged link
-  into a real merge is incidental, not assisted — it depends on the new agent
-  happening to redo the same Gmail search, not on anything that nudges it to.
+- Only links the judge actually flags get remembered. 
 - Descriptions are frozen at creation, so a thread that changes over months
   keeps its original label.
-- Pronoun-only requests ("ask them...") can't be matched by similarity
-  search — there's no name in the sentence to match against, and no
-  similarity cutoff fixes that.
 - Merging concatenates transcripts, so merged agents are the ones most
   likely to eventually hit a context limit.
 
