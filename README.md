@@ -115,20 +115,6 @@ larger than N=200 was measured, so this doesn't rule out degradation past that
 point; it only says the dilution-hurts-accuracy hypothesis didn't hold up
 within the tested range.
 
-**`eval_ablations.py` — does each layer earn its place?**
-
-| Layer removed | Effect | Verdict |
-|---|---|---|
-| Embeddings (lexical only) | recall 100% → 33% | justified |
-| LLM judgment | bad links staged 0 → 2 | justified |
-| Retrieval (show everything) | recall 100% → 100% | not justified on recall — cost only |
-| Similarity floor | recall 33% → 100% (floor was *hurting*) | floor was harmful — dropped to 0.20 |
-| Evidence gate | caught 3 bad links in one run, 0 in a rerun | insurance; not yet proven necessary on this scale of traffic |
-
-[Similarity floor was recalibrated from 0.60 down to 0.20 after a second
-dataset showed the higher value was actively cutting recall — full story in
-DESIGN.md.]
-
 **`eval_agent_matching.py` — is routing correct, end to end?**
 
 | Metric | Result |
