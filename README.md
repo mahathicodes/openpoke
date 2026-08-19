@@ -121,7 +121,6 @@ within the tested range.
 |---|---|
 | Accuracy / precision / recall / F1 | 100% / 100% / 100% / 1.00 |
 | Committed false merges | 0, across every live run |
-| Exact-match-only baseline | 0% recall on the same cases |
 | Judge consulted | 14 of 17 cases |
 
 [Across ~340 live judgment decisions total, the judge staged 3 bad links in
@@ -140,7 +139,7 @@ above concrete rather than abstract:
 | Same company, different matter | "Ask Vercel accounts payable about my outstanding contractor invoice." | **No** — same company as the offer thread, unrelated business |
 | Two people, same name, same topic | "Follow up on lunch with Keith," with two Keith-lunch agents already existing | Neither — must hold and ask which one |
 | Same setup, surname supplied | "Follow up with Keith Chen about our lunch." | Yes, specifically the Chen one — checks it discriminates rather than freezing whenever names collide |
-| Empty roster | "Draft a note to the landlord about the broken heater," no agents exist yet | Creates new, no LLM call needed at all |
+| Empty roster | "Draft a note to the landlord about the broken heater," no agents exist yet | Creates new |
 
 ### Known limitations
 
