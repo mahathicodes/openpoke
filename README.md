@@ -176,8 +176,6 @@ isolated pieces instead:
 - Only links the judge actually flags get remembered. 
 - Descriptions are frozen at creation, so a thread that changes over months
   keeps its original label.
-- Merging concatenates transcripts, so merged agents are the ones most
-  likely to eventually hit a context limit.
 
 **3. Gaps in the existing codebase we noticed**
 
