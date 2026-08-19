@@ -107,19 +107,13 @@ concurrency, and every branch of the routing ladder.
 | Measured | Old (full roster) | New (capped) |
 |---|---|---|
 | Prompt tokens at N=200 | 1,576 | 403 (flat regardless of N) |
-| Worst-case retrieval margin, N=11 → 200 | 0.870 → 0.000 | — |
 | Live selection accuracy, N=11 / N=200 | 100% / 94% | 100% / 100% |
-| Prompt-render recall @15, real embeddings, N=51 | — | 100% (18/18) |
 
 Accuracy showed no resolvable degradation across the roster sizes actually
 tested (up to N=200) — the fix is justified by cost, not accuracy. Nothing
 larger than N=200 was measured, so this doesn't rule out degradation past that
 point; it only says the dilution-hurts-accuracy hypothesis didn't hold up
-within the tested range. The recency guarantee's one live ablation was
-inconclusive: a just-touched agent survived a vague, pronoun-only follow-up
-whether the guarantee was on or off, so this single case shows the guarantee
-wasn't *necessary* for it — not that the guarantee doesn't matter more
-generally.
+within the tested range.
 
 **`eval_ablations.py` — does each layer earn its place?**
 
